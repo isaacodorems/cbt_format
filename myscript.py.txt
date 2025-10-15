@@ -1,0 +1,189 @@
+# ============================================================
+# 🚀 Astratrix Document Formatter (Flask Codespace Edition)
+# ============================================================
+# Features:
+# ✅ Upload .docx or .txt
+# ✅ Normalize messy formatting
+# ✅ Detect and mark correct answers automatically
+# ✅ Preview & download cleaned .txt / .docx
+# ============================================================
+
+import re, io, uuid
+from flask import Flask, render_template_string, request, send_file
+from docx import Document
+from docx.shared import Pt
+
+app = Flask(__name__)
+STORE = {}
+
+# ---------- TEXT EXTRACTION ----------
+def read_uploaded_text(file_storage):
+    fname = file_storage.filename or ""
+    if fname.lower().endswith(".docx"):
+        doc = Document(file_storage)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return "\n".join(paragraphs)
+    else:
+        content = file_storage.read()
+        try:
+            return content.decode("utf-8")
+        except Exception:
+            return content.decode("latin-1", errors="ignore")
+
+# ---------- PARSER ----------
+def normalize_option_markers(line):
+    return re.sub(r'^[\(\[]*([A-E])[\)\]\.:-]+\s*', r'\1: ', line.strip(), flags=re.I)
+
+def is_option_line(line): return bool(re.match(r'^[A-E]\s*:', line.strip(), flags=re.I))
+
+def is_question_start_line(line):
+    if re.match(r'^\s*(?:Q[:\)]|Question[:\)]|\d+\s*[\.\)])', line, flags=re.I): return True
+    if '?' in line and not is_option_line(line): return True
+    return False
+
+def parse_into_questions(text):
+    lines = [normalize_option_markers(l) for l in text.splitlines() if l.strip()]
+    questions, current_q, opts, correct = [], None, {}, None
+
+    def flush():
+        nonlocal current_q, opts, correct
+        if current_q and opts:
+            questions.append({'question': current_q.strip(), 'options': opts.copy(), 'correct': correct})
+        current_q, opts, correct = None, {}, None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Detect correct answer line
+        m = re.match(r'^(?:Answer|Correct\s*Answer|Correct\s*Option)[:\-\s]*([A-E])', line, flags=re.I)
+        if m:
+            correct = m.group(1).upper()
+            i += 1
+            continue
+
+        # Option line
+        if is_option_line(line):
+            n = re.match(r'^([A-E])\s*:\s*(.*)$', line)
+            if n:
+                letter, opt = n.groups()
+                if "*" in opt:
+                    opt = opt.replace("*", "").strip()
+                    correct = letter
+                opts[letter] = opt.strip()
+            i += 1
+            continue
+
+        # Question start
+        if is_question_start_line(line):
+            if current_q and opts:
+                flush()
+            qline = re.sub(r'^\s*(?:Q[:\)]|Question[:\)]|\d+\s*[\.\)])\s*', '', line)
+            current_q = qline.strip()
+            i += 1
+            continue
+
+        # Continuation of question
+        if current_q and not is_option_line(line):
+            current_q += " " + line
+        i += 1
+
+    if current_q and opts: flush()
+    return questions
+
+def to_system_text(questions):
+    blocks = []
+    for q in questions:
+        lines = [f"Q: {q['question']}"]
+        for l, txt in q['options'].items():
+            star = "*" if q.get("correct") == l else ""
+            lines.append(f"{l}: {txt}{star}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+def make_docx_bytes(system_text):
+    doc = Document()
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = "Calibri"
+    font.size = Pt(11)
+    for line in system_text.splitlines():
+        p = doc.add_paragraph(line)
+        run = p.runs[0]
+        run.font.name = "Calibri"
+        run.font.size = Pt(11)
+        p.paragraph_format.space_after = Pt(2)
+    buf = io.BytesIO(); doc.save(buf); buf.seek(0)
+    return buf
+
+# ---------- HTML ----------
+HTML_PAGE = """
+<!doctype html>
+<html>
+<head>
+<title>Astratrix Document Formatter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{background:#0d0f1a;color:#e6f0ff;font-family:Segoe UI,Arial;padding:20px}
+.container{max-width:900px;margin:auto;background:rgba(255,255,255,0.03);padding:20px;border-radius:12px}
+h1{color:#81d4fa}
+input[type=file]{background:#1a223b;color:#e6f0ff;padding:10px;border-radius:8px;border:1px dashed rgba(129,212,250,0.5);width:100%}
+textarea{width:100%;height:300px;background:#081120;color:#e6f0ff;border:none;border-radius:8px;margin-top:10px;padding:10px}
+button{background:#42a5f5;color:#0d0f1a;padding:10px 18px;border:none;border-radius:6px;cursor:pointer;font-weight:600;margin:4px 2px}
+footer{text-align:center;color:#9eb4d9;margin-top:20px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🚀 Astratrix Document Formatter</h1>
+<p>Upload a messy quiz (.docx or .txt). The app will clean formatting and mark correct answers automatically.</p>
+<form action="/" method="post" enctype="multipart/form-data">
+<input type="file" name="file" required>
+<br><br>
+<button type="submit">Process</button>
+</form>
+{% if text %}
+<hr><h3>Preview</h3>
+<textarea readonly>{{text}}</textarea>
+<form action="/download/txt/{{uid}}"><button>⬇️ Download .txt</button></form>
+<form action="/download/docx/{{uid}}"><button>⬇️ Download .docx</button></form>
+{% endif %}
+<footer>© 2025 Astratrix Formatter — Codespace Edition</footer>
+</div>
+</body>
+</html>
+"""
+
+# ---------- ROUTES ----------
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        file = request.files.get("file")
+        if not file:
+            return render_template_string(HTML_PAGE, text="No file selected.", uid="")
+        raw = read_uploaded_text(file)
+        questions = parse_into_questions(raw)
+        system_text = to_system_text(questions)
+        uid = str(uuid.uuid4())
+        STORE[uid] = system_text
+        return render_template_string(HTML_PAGE, text=system_text, uid=uid)
+    return render_template_string(HTML_PAGE, text=None, uid="")
+
+@app.route("/download/txt/<uid>")
+def download_txt(uid):
+    text = STORE.get(uid)
+    if not text: return "Not found", 404
+    buf = io.BytesIO(text.encode("utf-8"))
+    return send_file(buf, as_attachment=True, download_name="formatted_output.txt", mimetype="text/plain")
+
+@app.route("/download/docx/<uid>")
+def download_docx(uid):
+    text = STORE.get(uid)
+    if not text: return "Not found", 404
+    buf = make_docx_bytes(text)
+    return send_file(buf, as_attachment=True, download_name="formatted_output.docx",
+                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+if __name__ == "__main__":
+    # Codespaces: open to all interfaces
+    app.run(host="0.0.0.0", port=5000, debug=False)
